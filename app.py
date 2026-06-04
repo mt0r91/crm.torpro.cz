@@ -19,6 +19,22 @@ def get_db():
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
     db.execute("PRAGMA journal_mode = WAL")
+    db.execute("""CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'sales', active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT (datetime('now')))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS companies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT, city TEXT, region TEXT, country TEXT DEFAULT 'CZ', phone TEXT, email TEXT, website TEXT, ico TEXT, linkedin TEXT, source TEXT, owner_id INTEGER, status TEXT DEFAULT 'Новая компания', priority TEXT DEFAULT 'med', next_action TEXT, next_action_at TEXT, last_contact_at TEXT, notes TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL, full_name TEXT NOT NULL, position TEXT, phone TEXT, email TEXT, linkedin TEXT, language TEXT DEFAULT 'RU', is_primary INTEGER DEFAULT 0, notes TEXT, created_at TEXT DEFAULT (datetime('now')))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS activities (id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL, contact_id INTEGER, user_id INTEGER, type TEXT NOT NULL, title TEXT NOT NULL, description TEXT, result TEXT, created_at TEXT DEFAULT (datetime('now')), due_at TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, contact_id INTEGER, user_id INTEGER, type TEXT DEFAULT 'other', title TEXT NOT NULL, description TEXT, due_at TEXT, status TEXT DEFAULT 'open', priority TEXT DEFAULT 'med', created_at TEXT DEFAULT (datetime('now')), completed_at TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS email_templates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, subject TEXT, body TEXT, created_by INTEGER, created_at TEXT DEFAULT (datetime('now')))""")
+    db.commit()
+    # Создаём дефолтных пользователей если нет
+    if not db.execute("SELECT id FROM users WHERE role='admin'").fetchone():
+        import bcrypt as _bc
+        h = _bc.hashpw(b'admin123', _bc.gensalt()).decode()
+        h2 = _bc.hashpw(b'sales123', _bc.gensalt()).decode()
+        s1 = db.execute("INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)", ('Администратор','admin@torpro.cz',h,'admin')).lastrowid
+        db.execute("INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)", ('Марек Новак','marek@torpro.cz',h2,'manager'))
+        db.execute("INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)", ('Яна Горакова','jana@torpro.cz',h2,'sales'))
+        db.commit()
     return db
 
 def now():
