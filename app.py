@@ -25,6 +25,14 @@ def get_db():
     db.execute("""CREATE TABLE IF NOT EXISTS activities (id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL, contact_id INTEGER, user_id INTEGER, type TEXT NOT NULL, title TEXT NOT NULL, description TEXT, result TEXT, created_at TEXT DEFAULT (datetime('now')), due_at TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER, contact_id INTEGER, user_id INTEGER, type TEXT DEFAULT 'other', title TEXT NOT NULL, description TEXT, due_at TEXT, status TEXT DEFAULT 'open', priority TEXT DEFAULT 'med', created_at TEXT DEFAULT (datetime('now')), completed_at TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS email_templates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, subject TEXT, body TEXT, created_by INTEGER, created_at TEXT DEFAULT (datetime('now')))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, type TEXT, city TEXT, region TEXT,
+        phone TEXT, email TEXT, website TEXT, ico TEXT,
+        source TEXT, source_url TEXT, linkedin_url TEXT, notes TEXT,
+        checked INTEGER DEFAULT 0, in_crm INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')))""")
     db.commit()
     # Создаём дефолтных пользователей если нет
     if not db.execute("SELECT id FROM users WHERE role='admin'").fetchone():
@@ -563,6 +571,126 @@ def import_companies():
     db.commit(); db.close()
     return jsonify({'ok': True, 'imported': count})
 
+
+# ── LEAD FINDER ──
+@app.route('/api/leads', methods=['GET'])
+@auth_required
+def get_leads():
+    q = "SELECT * FROM leads WHERE 1=1"
+    params = []
+    f = request.args.get('filter','all')
+    srch = request.args.get('search','')
+    if srch:
+        q += " AND (name LIKE ? OR city LIKE ? OR type LIKE ?)"; s=f"%{srch}%"; params+=[s,s,s]
+    q += " ORDER BY created_at DESC"
+    db = get_db()
+    leads = rows_to_list(db.execute(q, params).fetchall())
+    db.close()
+    # compute dups
+    for l in leads:
+        l['is_dup'] = any(
+            o['id'] != l['id'] and (
+                o['name'].lower().strip() == l['name'].lower().strip() or
+                (l['ico'] and o['ico'] and o['ico'] == l['ico']) or
+                (l['phone'] and o['phone'] and o['phone'].replace(' ','') == l['phone'].replace(' ','')) or
+                (l['email'] and o['email'] and o['email'].lower() == l['email'].lower()) or
+                (l['website'] and o['website'] and o['website'].replace('www.','').lower() == l['website'].replace('www.','').lower())
+            ) for o in leads
+        )
+    if f == 'no_phone': leads = [l for l in leads if not l['phone']]
+    elif f == 'no_email': leads = [l for l in leads if not l['email']]
+    elif f == 'no_li': leads = [l for l in leads if not l['linkedin_url']]
+    elif f == 'not_checked': leads = [l for l in leads if not l['checked']]
+    elif f == 'ready': leads = [l for l in leads if l['phone'] and l['checked'] and not l['is_dup']]
+    elif f == 'dup': leads = [l for l in leads if l['is_dup']]
+    return jsonify(leads)
+
+@app.route('/api/leads', methods=['POST'])
+@auth_required
+def create_lead():
+    d = request.json
+    if not d.get('name'): return jsonify({'error': 'Укажите название'}), 400
+    db = get_db()
+    lid = db.execute("INSERT INTO leads(name,type,city,region,phone,email,website,ico,source,source_url,linkedin_url,notes,checked) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (d['name'],d.get('type'),d.get('city'),d.get('region'),d.get('phone'),d.get('email'),d.get('website'),d.get('ico'),d.get('source'),d.get('source_url'),d.get('linkedin_url'),d.get('notes'),1 if d.get('checked') else 0)).lastrowid
+    db.commit(); db.close()
+    return jsonify({'ok': True, 'id': lid})
+
+@app.route('/api/leads/<int:lid>', methods=['PUT'])
+@auth_required
+def update_lead(lid):
+    d = request.json
+    db = get_db()
+    l = row_to_dict(db.execute("SELECT * FROM leads WHERE id=?", (lid,)).fetchone())
+    if not l: db.close(); return jsonify({'error': 'Не найдено'}), 404
+    db.execute("UPDATE leads SET name=?,type=?,city=?,region=?,phone=?,email=?,website=?,ico=?,source=?,source_url=?,linkedin_url=?,notes=?,checked=?,updated_at=datetime('now') WHERE id=?",
+        (d.get('name',l['name']),d.get('type',l['type']),d.get('city',l['city']),d.get('region',l['region']),d.get('phone',l['phone']),d.get('email',l['email']),d.get('website',l['website']),d.get('ico',l['ico']),d.get('source',l['source']),d.get('source_url',l['source_url']),d.get('linkedin_url',l['linkedin_url']),d.get('notes',l['notes']),1 if d.get('checked') else 0,lid))
+    db.commit(); db.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/leads/<int:lid>/send-to-crm', methods=['POST'])
+@auth_required
+def lead_to_crm(lid):
+    db = get_db()
+    l = row_to_dict(db.execute("SELECT * FROM leads WHERE id=?", (lid,)).fetchone())
+    if not l: db.close(); return jsonify({'error': 'Не найдено'}), 404
+    cid = db.execute("INSERT INTO companies(name,type,city,region,phone,email,website,ico,source,linkedin,owner_id,status,priority) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (l['name'],l['type'],l['city'],l['region'],l['phone'],l['email'],l['website'],l['ico'],l['source'],l['linkedin_url'],session['user']['id'],'Новая компания','med')).lastrowid
+    db.execute("INSERT INTO activities(company_id,user_id,type,title,description) VALUES(?,?,?,?,?)",
+        (cid,session['user']['id'],'note','Добавлено из Lead Finder',f"Источник: {l['source'] or '—'}"))
+    db.execute("UPDATE leads SET in_crm=1, updated_at=datetime('now') WHERE id=?", (lid,))
+    db.commit(); db.close()
+    return jsonify({'ok': True, 'company_id': cid})
+
+@app.route('/api/leads/<int:lid>', methods=['DELETE'])
+@auth_required
+def delete_lead(lid):
+    db = get_db()
+    db.execute("DELETE FROM leads WHERE id=?", (lid,))
+    db.commit(); db.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/leads/import', methods=['POST'])
+@auth_required
+def import_leads():
+    rows = request.json.get('rows', [])
+    skip_dup = request.json.get('skip_dup', True)
+    default_src = request.json.get('default_source', '')
+    if not rows: return jsonify({'error': 'Нет данных'}), 400
+    db = get_db()
+    existing = rows_to_list(db.execute("SELECT name,ico,phone,email,website FROM leads").fetchall())
+    added = 0; skipped = 0
+    for r in rows:
+        if not r.get('name'): continue
+        if skip_dup:
+            is_dup = any(
+                (e['name'].lower().strip() == r['name'].lower().strip()) or
+                (r.get('ico') and e['ico'] and e['ico'] == r['ico']) or
+                (r.get('phone') and e['phone'] and e['phone'].replace(' ','') == r['phone'].replace(' ','')) or
+                (r.get('email') and e['email'] and e['email'].lower() == r['email'].lower())
+                for e in existing
+            )
+            if is_dup: skipped += 1; continue
+        db.execute("INSERT INTO leads(name,type,city,region,phone,email,website,ico,source,source_url,linkedin_url,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (r['name'],r.get('type'),r.get('city'),r.get('region'),r.get('phone'),r.get('email'),r.get('website'),r.get('ico'),r.get('source') or default_src,r.get('source_url'),r.get('linkedin_url'),r.get('notes')))
+        added += 1
+    db.commit(); db.close()
+    return jsonify({'ok': True, 'added': added, 'skipped': skipped})
+
+@app.route('/api/leads/stats', methods=['GET'])
+@auth_required
+def leads_stats():
+    db = get_db()
+    all_leads = rows_to_list(db.execute("SELECT * FROM leads").fetchall())
+    db.close()
+    total = len(all_leads)
+    in_crm = sum(1 for l in all_leads if l['in_crm'])
+    no_phone = sum(1 for l in all_leads if not l['phone'])
+    no_email = sum(1 for l in all_leads if not l['email'])
+    no_li = sum(1 for l in all_leads if not l['linkedin_url'])
+    checked = sum(1 for l in all_leads if l['checked'])
+    return jsonify({'total':total,'in_crm':in_crm,'no_phone':no_phone,'no_email':no_email,'no_li':no_li,'checked':checked})
+
 # ── STATIC ──
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
@@ -787,6 +915,7 @@ textarea.fi{resize:vertical;min-height:70px}
       <div class="ni" onclick="go('tasks')" id="nav-tasks"><i class="ti ti-checkbox"></i> Задачи <span class="nbadge" id="nb-tasks">0</span></div>
       <div class="ni" onclick="go('contacts')" id="nav-contacts"><i class="ti ti-users"></i> Контакты</div>
       <div class="ns">Настройки</div>
+      <div class="ni" onclick="go('leads')" id="nav-leads"><i class="ti ti-radar-2"></i> Lead Finder <span class="nbadge" id="nb-leads">0</span></div>
       <div class="ni" onclick="go('settings')" id="nav-settings"><i class="ti ti-settings"></i> Настройки</div>
       <div class="ni admin-only hidden" onclick="go('admin')" id="nav-admin"><i class="ti ti-shield"></i> Администратор</div>
     </div>
@@ -879,6 +1008,39 @@ textarea.fi{resize:vertical;min-height:70px}
           <thead><tr><th>Имя</th><th>Компания</th><th>Должность</th><th>Телефон</th><th>E-mail</th><th style="width:80px"></th></tr></thead>
           <tbody id="ct-tb"></tbody>
         </table></div>
+      </div>
+
+      <!-- LEAD FINDER -->
+      <div class="screen hidden" id="scr-leads">
+        <div class="fb-bar" style="gap:6px">
+          <span class="fbl">Фильтр:</span>
+          <button class="fb act" onclick="setLF(this,'all')">Все</button>
+          <button class="fb" onclick="setLF(this,'no_phone')"><i class="ti ti-phone-off"></i> Без телефона</button>
+          <button class="fb" onclick="setLF(this,'no_email')"><i class="ti ti-mail-off"></i> Без e-mail</button>
+          <button class="fb" onclick="setLF(this,'no_li')"><i class="ti ti-brand-linkedin"></i> Без LinkedIn</button>
+          <button class="fb" onclick="setLF(this,'not_checked')"><i class="ti ti-clock"></i> Не проверено</button>
+          <button class="fb" onclick="setLF(this,'ready')"><i class="ti ti-check"></i> К звонку</button>
+          <button class="fb" onclick="setLF(this,'dup')"><i class="ti ti-copy"></i> Дубли</button>
+          <div style="margin-left:auto;display:flex;gap:6px">
+            <button class="btn btn-ghost btn-sm" onclick="showLeadImport()"><i class="ti ti-upload"></i> CSV</button>
+            <button class="btn btn-red btn-sm" onclick="showAddLead()"><i class="ti ti-plus"></i> Добавить</button>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;padding:10px 14px;background:var(--bg2);border-bottom:0.5px solid var(--bd2)" id="lead-stats"></div>
+        <div class="tw"><table>
+          <thead><tr>
+            <th style="width:20px"><input type="checkbox" id="lf-chk-all" onchange="toggleAllLeads(this)"></th>
+            <th>Компания</th><th>Тип</th><th>Город</th>
+            <th>Телефон</th><th>E-mail</th><th>IČO</th><th>Источник</th><th>Статус</th>
+            <th style="width:130px">Действия</th>
+          </tr></thead>
+          <tbody id="leads-tb"></tbody>
+        </table></div>
+        <div id="lead-bulk" style="display:none;background:var(--bg2);border-top:0.5px solid var(--bd2);padding:8px 14px;align-items:center;gap:10px">
+          <span style="font-size:12px;color:var(--mu)" id="lead-sel-cnt">0 выбрано</span>
+          <button class="btn btn-red btn-sm" onclick="sendSelLeadsToCrm()"><i class="ti ti-send"></i> В CRM</button>
+          <button class="btn btn-sm" onclick="delSelLeads()"><i class="ti ti-trash"></i> Удалить</button>
+        </div>
       </div>
 
       <!-- НАСТРОЙКИ -->
@@ -1039,8 +1201,8 @@ async function checkAuth() {
 }
 
 // ── NAVIGATION ──
-const SCREENS = {dash:'Дашборд',cos:'Компании',kanban:'Pipeline',tasks:'Задачи',contacts:'Контакты',settings:'Настройки',admin:'Администратор',profile:'Профиль'};
-const ICONS = {dash:'ti-layout-dashboard',cos:'ti-building',kanban:'ti-layout-kanban',tasks:'ti-checkbox',contacts:'ti-users',settings:'ti-settings',admin:'ti-shield',profile:'ti-user'};
+const SCREENS = {dash:'Дашборд',cos:'Компании',kanban:'Pipeline',tasks:'Задачи',contacts:'Контакты',leads:'Lead Finder',settings:'Настройки',admin:'Администратор',profile:'Профиль'};
+const ICONS = {dash:'ti-layout-dashboard',cos:'ti-building',kanban:'ti-layout-kanban',tasks:'ti-checkbox',contacts:'ti-users',leads:'ti-radar-2',settings:'ti-settings',admin:'ti-shield',profile:'ti-user'};
 
 function go(s) {
   document.querySelectorAll('.screen').forEach(e=>e.classList.add('hidden'));
@@ -1054,6 +1216,7 @@ function go(s) {
   if (s==='tasks') loadTasks();
   if (s==='contacts') loadContacts();
   if (s==='settings') loadSettings();
+  if (s==='leads') loadLeads();
   if (s==='admin') loadAdmin();
   if (s==='profile') loadProfile();
 }
@@ -1622,6 +1785,290 @@ function setTf(btn, v) { tfFilter = v; document.querySelectorAll('#scr-tasks .fb
 function searchCos(q) { coSearch = q; if (document.getElementById('scr-cos').classList.contains('hidden')===false) loadCos(); }
 function filterGoCos(f) { coFilter = f; go('cos'); }
 function filterGoTasks(f) { tfFilter = f; go('tasks'); }
+
+
+// ── LEAD FINDER ──
+const LF_SOURCES = ['Firmy.cz','Živéfirmy.cz','Google Maps','LinkedIn','Ручной список','Другой'];
+const LF_TYPES = ['Генподрядчик','Строительная компания','Facility management','Управляющая компания','Логистический центр','Промышленный объект','Парковка','Мосты / инфраструктура','Девелопер','Проектная организация','Производственный цех','Гос. сектор','Другой'];
+let lfFilter = 'all', lfSel = new Set();
+
+async function loadLeads() {
+  const params = new URLSearchParams({filter: lfFilter});
+  const q = document.getElementById('sinp').value;
+  if (q) params.set('search', q);
+  const [leads, stats] = await Promise.all([
+    api('GET', '/api/leads?' + params),
+    api('GET', '/api/leads/stats')
+  ]);
+  document.getElementById('nb-leads').textContent = stats.total || 0;
+  renderLeadStats(stats);
+  renderLeadsTable(leads);
+}
+
+function renderLeadStats(s) {
+  document.getElementById('lead-stats').innerHTML = [
+    ['var(--bl)', s.total||0, 'Всего'],
+    ['#15803d', (s.total||0)-(s.no_phone||0)-(s.no_email||0) > 0 ? s.total-s.no_phone : 0, 'С телефоном'],
+    ['var(--am)', s.no_phone||0, 'Без телефона'],
+    ['#8b5cf6', s.no_email||0, 'Без e-mail'],
+    ['#0a66c2', s.no_li||0, 'Без LinkedIn'],
+    ['var(--mu)', s.in_crm||0, 'В CRM'],
+  ].map(([c,n,l])=>`<div style="background:var(--bg);border:0.5px solid var(--bd);border-radius:6px;padding:8px 10px"><div style="font-size:18px;font-weight:500;color:${c}">${n}</div><div style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:1px;margin-top:2px">${l}</div></div>`).join('');
+}
+
+function renderLeadsTable(leads) {
+  const tb = document.getElementById('leads-tb');
+  if (!leads.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:30px;color:var(--mu);font-size:13px">Нет лидов по фильтру</td></tr>'; return; }
+  tb.innerHTML = leads.map(l => {
+    const sel = lfSel.has(l.id);
+    let statusHtml = '';
+    if (l.in_crm) statusHtml = '<span class="pill p-won" style="font-size:10px">В CRM</span>';
+    else if (l.is_dup) statusHtml = '<span class="pill p-lost" style="font-size:10px">Дубль</span>';
+    else if (l.phone && l.checked) statusHtml = '<span class="pill p-int" style="font-size:10px">К звонку</span>';
+    else statusHtml = '<span class="pill p-call" style="font-size:10px">Не готово</span>';
+    const dots = [
+      !l.phone ? '<span style="width:6px;height:6px;border-radius:50%;background:var(--am);display:inline-block" title="Нет телефона"></span>' : '',
+      !l.email ? '<span style="width:6px;height:6px;border-radius:50%;background:#8b5cf6;display:inline-block" title="Нет e-mail"></span>' : '',
+      !l.linkedin_url ? '<span style="width:6px;height:6px;border-radius:50%;background:#0a66c2;display:inline-block" title="Нет LinkedIn"></span>' : '',
+    ].join('');
+    return `<tr style="${l.is_dup ? 'border-left:2px solid var(--am)' : ''}" onclick="editLead_lf(${l.id})">
+      <td onclick="event.stopPropagation()"><input type="checkbox" ${sel?'checked':''} onchange="toggleLfSel(${l.id},this)"></td>
+      <td><div style="font-weight:500;font-size:12px">${l.name}</div><div style="font-size:11px;color:var(--mu)">${l.website||''}</div></td>
+      <td style="font-size:11px;color:var(--mu)">${l.type||'—'}</td>
+      <td style="font-size:11px">${l.city||'—'}</td>
+      <td>${l.phone ? `<a href="tel:${l.phone}" style="font-size:11px;color:var(--bl);text-decoration:none" onclick="event.stopPropagation()">${l.phone}</a>` : '<span style="font-size:11px;color:var(--mu)">—</span>'}</td>
+      <td>${l.email ? `<a href="mailto:${l.email}" style="font-size:11px;color:#8b5cf6;text-decoration:none" onclick="event.stopPropagation()">${l.email}</a>` : '<span style="font-size:11px;color:var(--mu)">—</span>'}</td>
+      <td style="font-size:11px;color:var(--mu)">${l.ico||'—'}</td>
+      <td><span style="font-size:10px;padding:2px 7px;border-radius:3px;background:var(--bg2);border:0.5px solid var(--bd);color:var(--mu)">${l.source||'—'}</span></td>
+      <td><div style="display:flex;align-items:center;gap:4px">${statusHtml}<span style="display:flex;gap:2px">${dots}</span></div></td>
+      <td onclick="event.stopPropagation()">
+        <div style="display:flex;gap:3px">
+          <button class="btn btn-sm" style="color:#0a66c2;border-color:rgba(10,102,194,.3)" onclick="lfLinkedIn(${l.id})" title="Найти в LinkedIn"><i class="ti ti-brand-linkedin"></i></button>
+          ${!l.in_crm && !l.is_dup ? `<button class="btn btn-sm" style="color:#15803d;border-color:rgba(34,197,94,.3)" onclick="sendLeadToCrm(${l.id})" title="В CRM"><i class="ti ti-send"></i></button>` : ''}
+          <button class="btn btn-sm" style="color:var(--red);border-color:rgba(224,32,32,.2)" onclick="deleteLfLead(${l.id})" title="Удалить"><i class="ti ti-trash"></i></button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function setLF(btn, v) {
+  lfFilter = v;
+  document.querySelectorAll('#scr-leads .fb').forEach(b=>b.classList.remove('act'));
+  btn.classList.add('act');
+  loadLeads();
+}
+
+function toggleLfSel(id, chk) { if(chk.checked) lfSel.add(id); else lfSel.delete(id); updateLfBulk(); }
+function toggleAllLeads(chk) {
+  document.querySelectorAll('#leads-tb input[type=checkbox]').forEach(c => {
+    const id = parseInt(c.closest('tr').querySelector('[onclick*=editLead_lf]')?.getAttribute('onclick')?.match(/\d+/)?.[0]);
+    if(id) { if(chk.checked) lfSel.add(id); else lfSel.delete(id); }
+    c.checked = chk.checked;
+  });
+  updateLfBulk();
+}
+function updateLfBulk() {
+  const bar = document.getElementById('lead-bulk');
+  document.getElementById('lead-sel-cnt').textContent = lfSel.size + ' выбрано';
+  bar.style.display = lfSel.size > 0 ? 'flex' : 'none';
+}
+
+async function sendLeadToCrm(id) {
+  const r = await api('POST', '/api/leads/'+id+'/send-to-crm', {});
+  if (r.ok) { showToast('Компания добавлена в CRM', 'gr'); loadLeads(); }
+}
+
+async function sendSelLeadsToCrm() {
+  let count = 0;
+  for (const id of lfSel) { const r = await api('POST', '/api/leads/'+id+'/send-to-crm', {}); if(r.ok) count++; }
+  lfSel.clear();
+  showToast(`${count} компаний добавлено в CRM`, 'gr');
+  loadLeads();
+}
+
+async function deleteLfLead(id) {
+  if (!confirm('Удалить лид?')) return;
+  await api('DELETE', '/api/leads/'+id);
+  loadLeads();
+}
+
+async function delSelLeads() {
+  if (!confirm(`Удалить ${lfSel.size} лидов?`)) return;
+  for (const id of lfSel) await api('DELETE', '/api/leads/'+id);
+  lfSel.clear();
+  loadLeads();
+}
+
+function lfLinkedIn(id) {
+  api('GET', '/api/leads?filter=all').then(leads => {
+    const l = leads.find(x=>x.id===id);
+    if (!l) return;
+    const q = encodeURIComponent(l.name + ' ' + (l.city||'') + ' stavební');
+    window.open('https://www.linkedin.com/search/results/companies/?keywords='+q, '_blank');
+  });
+}
+
+function showAddLead() { showLeadModal_lf(null); }
+
+async function editLead_lf(id) {
+  const leads = await api('GET', '/api/leads?filter=all');
+  const l = leads.find(x=>x.id===id);
+  showLeadModal_lf(l);
+}
+
+function showLeadModal_lf(l) {
+  const isEdit = !!l;
+  document.getElementById('modal-root').innerHTML = `
+  <div class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-title">${isEdit?'Редактировать лид':'Новый лид'} <button class="btn btn-sm" onclick="closeModal()"><i class="ti ti-x"></i></button></div>
+    <div id="lf-dup-warn" style="background:rgba(245,158,11,.1);border:0.5px solid rgba(245,158,11,.4);border-radius:6px;padding:8px 12px;font-size:12px;color:#92400e;margin-bottom:10px;display:none;gap:6px;align-items:center"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fg"><label class="fl2">Название *</label><input class="fi" id="lf-name" value="${l?.name||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="OHL ŽS a.s."></div>
+      <div class="fg"><label class="fl2">Тип</label><select class="fi" id="lf-type">${LF_TYPES.map(t=>`<option ${l?.type===t?'selected':''}>${t}</option>`).join('')}</select></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fg"><label class="fl2">Сайт</label><input class="fi" id="lf-web" value="${l?.website||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="firma.cz"></div>
+      <div class="fg"><label class="fl2">IČO</label><input class="fi" id="lf-ico" value="${l?.ico||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="12345678"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fg"><label class="fl2">Телефон</label><input class="fi" id="lf-phone" value="${l?.phone||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="+420 xxx xxx xxx"></div>
+      <div class="fg"><label class="fl2">E-mail</label><input class="fi" id="lf-email" value="${l?.email||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="info@firma.cz"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fg"><label class="fl2">Город</label><input class="fi" id="lf-city" value="${l?.city||''}" placeholder="Прага"></div>
+      <div class="fg"><label class="fl2">Регион</label><input class="fi" id="lf-region" value="${l?.region||''}" placeholder="Прага"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fg"><label class="fl2">Источник</label><select class="fi" id="lf-src">${LF_SOURCES.map(s=>`<option ${l?.source===s?'selected':''}>${s}</option>`).join('')}</select></div>
+      <div class="fg"><label class="fl2">URL источника</label><input class="fi" id="lf-src-url" value="${l?.source_url||''}" placeholder="https://firmy.cz/..."></div>
+    </div>
+    <div class="fg"><label class="fl2">LinkedIn URL</label>
+      <div style="display:flex;gap:6px">
+        <input class="fi" id="lf-li" value="${l?.linkedin_url||''}" placeholder="https://linkedin.com/company/..." style="flex:1">
+        <button class="btn btn-sm" style="color:#0a66c2;border-color:rgba(10,102,194,.3)" onclick="lfOpenLinkedIn()"><i class="ti ti-brand-linkedin"></i> Найти</button>
+      </div>
+    </div>
+    <div class="fg"><label class="fl2">Заметки</label><textarea class="fi" id="lf-notes">${l?.notes||''}</textarea></div>
+    <div class="fg"><label style="font-size:12px;display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="lf-checked" ${l?.checked?'checked':''}> Проверено — готово к звонку</label></div>
+    <div class="modal-footer">
+      ${isEdit && !l.in_crm ? `<button class="btn btn-sm" style="color:#15803d;border-color:rgba(34,197,94,.3)" onclick="sendLeadToCrm(${l.id});closeModal()"><i class="ti ti-send"></i> В CRM</button>` : ''}
+      <button class="btn btn-sm" onclick="closeModal()">Отмена</button>
+      <button class="btn btn-red btn-sm" onclick="saveLfLead(${l?.id||0})"><i class="ti ti-check"></i> ${isEdit?'Сохранить':'Добавить'}</button>
+    </div>
+  </div></div>`;
+}
+
+async function lfCheckDup(excludeId) {
+  const name = document.getElementById('lf-name')?.value||'';
+  if (!name) return;
+  const leads = await api('GET', '/api/leads?filter=all');
+  const dups = leads.filter(l => l.id !== excludeId && (
+    l.name.toLowerCase().trim() === name.toLowerCase().trim() ||
+    (document.getElementById('lf-ico')?.value && l.ico === document.getElementById('lf-ico').value) ||
+    (document.getElementById('lf-phone')?.value && l.phone && l.phone.replace(/\s/g,'') === document.getElementById('lf-phone').value.replace(/\s/g,'')) ||
+    (document.getElementById('lf-email')?.value && l.email && l.email.toLowerCase() === document.getElementById('lf-email').value.toLowerCase())
+  ));
+  const warn = document.getElementById('lf-dup-warn');
+  if (!warn) return;
+  if (dups.length) {
+    warn.style.display = 'flex';
+    warn.innerHTML = '<i class="ti ti-alert-triangle" style="font-size:14px;flex-shrink:0"></i> Возможный дубль: "' + dups[0].name + '"';
+  } else {
+    warn.style.display = 'none';
+  }
+}
+
+function lfOpenLinkedIn() {
+  const name = document.getElementById('lf-name')?.value||'';
+  const city = document.getElementById('lf-city')?.value||'';
+  if (!name) return;
+  window.open('https://www.linkedin.com/search/results/companies/?keywords='+encodeURIComponent(name+' '+city+' stavební'), '_blank');
+}
+
+async function saveLfLead(id) {
+  const name = document.getElementById('lf-name')?.value?.trim();
+  if (!name) { alert('Укажите название'); return; }
+  const data = {
+    name, type: document.getElementById('lf-type').value,
+    website: document.getElementById('lf-web').value,
+    ico: document.getElementById('lf-ico').value,
+    phone: document.getElementById('lf-phone').value,
+    email: document.getElementById('lf-email').value,
+    city: document.getElementById('lf-city').value,
+    region: document.getElementById('lf-region').value,
+    source: document.getElementById('lf-src').value,
+    source_url: document.getElementById('lf-src-url').value,
+    linkedin_url: document.getElementById('lf-li').value,
+    notes: document.getElementById('lf-notes').value,
+    checked: document.getElementById('lf-checked').checked,
+  };
+  if (id) { await api('PUT', '/api/leads/'+id, data); showToast('Лид обновлён', 'gr'); }
+  else { await api('POST', '/api/leads', data); showToast('"'+name+'" добавлен в Lead Finder', 'gr'); }
+  closeModal(); loadLeads();
+}
+
+let lfCsvRows = [];
+function showLeadImport() {
+  document.getElementById('modal-root').innerHTML = `
+  <div class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-title">Импорт CSV в Lead Finder <button class="btn btn-sm" onclick="closeModal()"><i class="ti ti-x"></i></button></div>
+    <div style="background:var(--bg2);border-radius:6px;padding:10px 12px;font-size:12px;margin-bottom:12px;border:0.5px solid var(--bd)">
+      <div style="font-size:11px;font-weight:500;margin-bottom:4px">Формат CSV:</div>
+      <code style="font-size:10px;color:var(--am)">company_name, type, website, phone, email, city, region, ico, source, linkedin_url, notes</code>
+    </div>
+    <div class="fg"><label class="fl2">CSV файл</label><input class="fi" type="file" id="lf-csv" accept=".csv" onchange="previewLfCsv(this)"></div>
+    <div id="lf-csv-preview" style="font-size:12px;color:var(--mu);margin:6px 0"></div>
+    <div class="fg"><label class="fl2">Источник по умолчанию</label><select class="fi" id="lf-csv-src">${LF_SOURCES.map(s=>`<option>${s}</option>`).join('')}</select></div>
+    <div class="fg"><label style="font-size:12px;display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="lf-skip-dup" checked> Пропускать дубли автоматически</label></div>
+    <div class="modal-footer">
+      <button class="btn btn-sm" onclick="closeModal()">Отмена</button>
+      <button class="btn btn-red btn-sm" onclick="doLfImport()"><i class="ti ti-upload"></i> Импортировать</button>
+    </div>
+  </div></div>`;
+}
+
+function previewLfCsv(input) {
+  const file = input.files[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const lines = ev.target.result.split('\n').filter(l=>l.trim());
+    const headers = lines[0].split(',').map(h=>h.trim().toLowerCase().replace(/["]/g,''));
+    lfCsvRows = lines.slice(1).map(line => {
+      const vals = line.split(',').map(v=>v.trim().replace(/^"|"$/g,''));
+      const obj = {}; headers.forEach((h,i)=>obj[h]=vals[i]||'');
+      return {name:obj.company_name||obj.name||'',type:obj.type||'',website:obj.website||'',phone:obj.phone||'',email:obj.email||'',city:obj.city||'',region:obj.region||'',ico:obj.ico||'',source:obj.source||'',source_url:obj.source_url||'',linkedin_url:obj.linkedin_url||'',notes:obj.notes||''};
+    }).filter(r=>r.name);
+    document.getElementById('lf-csv-preview').textContent = 'Найдено: ' + lfCsvRows.length + ' компаний';
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+async function doLfImport() {
+  if (!lfCsvRows.length) { alert('Загрузите CSV'); return; }
+  const r = await api('POST', '/api/leads/import', {
+    rows: lfCsvRows,
+    skip_dup: document.getElementById('lf-skip-dup').checked,
+    default_source: document.getElementById('lf-csv-src').value
+  });
+  closeModal();
+  showToast(`Добавлено: ${r.added}${r.skipped ? ', пропущено дублей: '+r.skipped : ''}`, 'gr');
+  loadLeads();
+}
+
+function showToast(msg, type) {
+  const t = document.getElementById('toast');
+  const m = document.getElementById('toast-msg');
+  if (!t || !m) return;
+  t.className = 'toast show';
+  t.style.borderColor = type==='gr' ? 'rgba(34,197,94,.4)' : type==='am' ? 'rgba(245,158,11,.4)' : 'rgba(224,32,32,.4)';
+  t.style.color = type==='gr' ? '#15803d' : type==='am' ? '#92400e' : 'var(--red)';
+  m.textContent = msg;
+  clearTimeout(window._toastT);
+  window._toastT = setTimeout(()=>t.classList.remove('show'), 3000);
+}
 
 // ── INIT ──
 checkAuth();
