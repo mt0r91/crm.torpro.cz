@@ -129,6 +129,9 @@ def init_db():
     db.commit()
     db.close()
 
+# Инициализация БД при загрузке модуля (работает с gunicorn)
+init_db()
+
 # ── HELPERS ──
 def row_to_dict(row):
     return dict(row) if row else None
