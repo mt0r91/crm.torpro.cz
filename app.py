@@ -691,6 +691,53 @@ def leads_stats():
     checked = sum(1 for l in all_leads if l['checked'])
     return jsonify({'total':total,'in_crm':in_crm,'no_phone':no_phone,'no_email':no_email,'no_li':no_li,'checked':checked})
 
+
+# ── ARES (Czech Business Register) ──
+@app.route('/api/ares/<ico>', methods=['GET'])
+@auth_required
+def ares_lookup(ico):
+    import urllib.request, json as _json
+    ico = ico.strip().zfill(8)
+    try:
+        url = f'https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-subjekty/{ico}'
+        req = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'TORPRO-CRM/1.0'})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = _json.loads(r.read().decode())
+        # Extract address
+        addr = data.get('sidlo', {})
+        city = addr.get('nazevObce', '') or addr.get('nazevCastiObce', '')
+        street = addr.get('nazevUlice', '')
+        house = addr.get('cisloDomovni', '')
+        zip_code = addr.get('psc', '')
+        region_code = addr.get('kodKraje', '')
+        region_map = {
+            'CZ010':'Прага','CZ020':'Среднечешский','CZ031':'Южночешский',
+            'CZ032':'Пльзеньский','CZ041':'Карловарский','CZ042':'Устецкий',
+            'CZ051':'Либерецкий','CZ052':'Краловеградецкий','CZ053':'Пардубицкий',
+            'CZ063':'Высочина','CZ064':'Южноморавский','CZ071':'Оломоуцкий',
+            'CZ072':'Злинский','CZ080':'Моравскосилезский'
+        }
+        region = region_map.get(region_code, '')
+        address = ' '.join(filter(None, [street, str(house) if house else '', city, str(zip_code) if zip_code else '']))
+        return _json.dumps({
+            'ok': True,
+            'ico': data.get('ico', ico),
+            'name': data.get('obchodniJmeno', '') or data.get('nazev', ''),
+            'city': city,
+            'region': region,
+            'address': address,
+            'zip': str(zip_code) if zip_code else '',
+            'legal_form': data.get('pravniForma', {}).get('nazev', '') if isinstance(data.get('pravniForma'), dict) else '',
+            'status': data.get('stavSubjektu', {}).get('nazev', '') if isinstance(data.get('stavSubjektu'), dict) else '',
+            'founded': data.get('datumVzniku', '')[:4] if data.get('datumVzniku') else '',
+        }, ensure_ascii=False), 200, {'Content-Type': 'application/json; charset=utf-8'}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return _json.dumps({'ok': False, 'error': f'IČO {ico} не найдено в реестре ARES'}), 404, {'Content-Type': 'application/json'}
+        return _json.dumps({'ok': False, 'error': f'Ошибка ARES: {e.code}'}), 500, {'Content-Type': 'application/json'}
+    except Exception as e:
+        return _json.dumps({'ok': False, 'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
 # ── STATIC ──
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
@@ -878,6 +925,10 @@ textarea.fi{resize:vertical;min-height:70px}
 .crb{background:var(--bg3);border:0.5px solid var(--bd2);color:var(--w);font-size:12px;padding:7px 12px;border-radius:5px;cursor:pointer;text-align:left;transition:all .1s}
 .crb:hover{border-color:var(--red);background:rgba(224,32,32,.1)}.crb.sel{border-color:var(--red);background:rgba(224,32,32,.15)}
 .clbl{font-size:11px;color:var(--mu);margin-bottom:4px}
+</style>
+<style>
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.ares-result{background:rgba(59,130,246,.08);border:0.5px solid rgba(59,130,246,.25);border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:10px;display:none}
 </style>
 </head>
 <body>
@@ -1560,7 +1611,7 @@ function showAddCoModal() {
     <div class="fi-row"><div class="fg"><label class="fl">Телефон</label><input class="fi" id="c-phone"></div>
     <div class="fg"><label class="fl">Email</label><input class="fi" type="email" id="c-email"></div></div>
     <div class="fi-row"><div class="fg"><label class="fl">Сайт</label><input class="fi" id="c-web"></div>
-    <div class="fg"><label class="fl">ИНН / IČO</label><input class="fi" id="c-ico"></div></div>
+    <div class="fg"><label class="fl">IČO</label><div style="display:flex;gap:6px"><input class="fi" id="c-ico" placeholder="12345678" style="flex:1"><button class="btn btn-sm" style="background:rgba(59,130,246,.1);color:#1d4ed8;border-color:rgba(59,130,246,.3);flex-shrink:0;white-space:nowrap" onclick="aresLookupCo()" title="Заполнить из ARES"><i class="ti ti-database-search"></i> ARES</button></div></div></div>
     <div class="fi-row"><div class="fg"><label class="fl">Источник</label><input class="fi" id="c-src" placeholder="LinkedIn, Google Maps..."></div>
     <div class="fg"><label class="fl">Приоритет</label><select class="fi" id="c-pri"><option value="med">Средний</option><option value="high">Высокий</option><option value="low">Низкий</option></select></div></div>
     <div class="fg"><label class="fl">Заметка</label><textarea class="fi" id="c-notes"></textarea></div>
@@ -1787,6 +1838,54 @@ function filterGoCos(f) { coFilter = f; go('cos'); }
 function filterGoTasks(f) { tfFilter = f; go('tasks'); }
 
 
+
+// ── ARES LOOKUP ──
+async function aresLookup(ico, fillFn) {
+  if (!ico || ico.length < 6) { alert('Введите IČO (минимум 6 цифр)'); return; }
+  const btn = event.target.closest('button');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="ti ti-loader" style="animation:spin 1s linear infinite;font-size:12px"></i> Поиск...'; }
+  try {
+    const r = await api('GET', '/api/ares/' + ico.replace(/\s/g,''));
+    if (!r.ok) { alert(r.error || 'Ошибка ARES'); return; }
+    fillFn(r);
+    showToast(`ARES: найдено "${r.name}"`, 'gr');
+  } catch(e) {
+    alert('Ошибка соединения с ARES');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="ti ti-database-search"></i> ARES'; }
+  }
+}
+
+function aresLookupCo() {
+  const ico = document.getElementById('c-ico')?.value;
+  aresLookup(ico, (r) => {
+    if (r.name) document.getElementById('c-name').value = r.name;
+    if (r.city) document.getElementById('c-city').value = r.city;
+    if (r.region) document.getElementById('c-region').value = r.region;
+    if (r.ico) document.getElementById('c-ico').value = r.ico;
+  });
+}
+
+function aresLookupLf() {
+  const ico = document.getElementById('lf-ico')?.value;
+  aresLookup(ico, (r) => {
+    if (r.name) document.getElementById('lf-name').value = r.name;
+    if (r.city) document.getElementById('lf-city').value = r.city;
+    if (r.region) document.getElementById('lf-region').value = r.region;
+    if (r.ico) document.getElementById('lf-ico').value = r.ico;
+    lfCheckDup(0);
+  });
+}
+
+function aresLookupEdit() {
+  const ico = document.getElementById('ec-ico')?.value;
+  aresLookup(ico, (r) => {
+    if (r.name) document.getElementById('ec-name').value = r.name;
+    if (r.city) document.getElementById('ec-city').value = r.city;
+    if (r.region) document.getElementById('ec-region').value = r.region;
+  });
+}
+
 // ── LEAD FINDER ──
 const LF_SOURCES = ['Firmy.cz','Živéfirmy.cz','Google Maps','LinkedIn','Ручной список','Другой'];
 const LF_TYPES = ['Генподрядчик','Строительная компания','Facility management','Управляющая компания','Логистический центр','Промышленный объект','Парковка','Мосты / инфраструктура','Девелопер','Проектная организация','Производственный цех','Гос. сектор','Другой'];
@@ -1930,7 +2029,7 @@ function showLeadModal_lf(l) {
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
       <div class="fg"><label class="fl2">Сайт</label><input class="fi" id="lf-web" value="${l?.website||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="firma.cz"></div>
-      <div class="fg"><label class="fl2">IČO</label><input class="fi" id="lf-ico" value="${l?.ico||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="12345678"></div>
+      <div class="fg"><label class="fl2">IČO</label><div style="display:flex;gap:6px"><input class="fi" id="lf-ico" value="${l?.ico||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="12345678" style="flex:1"><button class="btn btn-sm" style="background:rgba(59,130,246,.1);color:#1d4ed8;border-color:rgba(59,130,246,.3);flex-shrink:0;white-space:nowrap" onclick="aresLookupLf()" title="Заполнить из ARES"><i class="ti ti-database-search"></i> ARES</button></div></div>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
       <div class="fg"><label class="fl2">Телефон</label><input class="fi" id="lf-phone" value="${l?.phone||''}" oninput="lfCheckDup(${l?.id||0})" placeholder="+420 xxx xxx xxx"></div>
